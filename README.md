@@ -6,7 +6,7 @@ The goal is a faithful vector-native reimplementation, not sprite emulation and 
 
 ## Status
 
-Current main build: **V8** (`webwarp.py`).
+Current main build: **V10** (`webwarp.py`).
 
 Implemented/reconstructed so far includes:
 
@@ -14,7 +14,13 @@ Implemented/reconstructed so far includes:
 - original ROM vector models for Hawk King, Guardian Drones, creatures/trophies, portal and Cosmic Dragon
 - deterministic `$191C` web/camera motion script
 - original 3-byte moving web-line pool and speed-dependent spacing
-- foreground web continuation corresponding to the separate fixed-`$E0` web render pass
+- exact digital geometry of `$08CF`: eight two-segment foreground rails at fixed `$E0`
+- frame-pipelined transformed web packet matching the RAM copy at `$CAB9`
+- exact `$C92F-$C94E` 32-byte web displacement table
+- render-first `$0048` frame scheduler: current/latched state is drawn before gameplay mutation
+- `$0C75` transformed world-coordinate latches consumed on the following render
+- render-side depth advancement for shots, web records, Guardians, Creature and Portal
+- runtime web records keep their 16-bit depth and natural wrap instead of fake `$E0` recycling
 - Vectrex BIOS Rise/Run rotation table and integer transform math
 - reconstructed `$094F` draw-displacement path
 - continuous Hawk movement using ROM-derived 16-bit web motion tables
@@ -23,7 +29,7 @@ Implemented/reconstructed so far includes:
 - Trophy Room / Trophy Room 2 behavior, including an option for the original `$20` bug
 - hidden programmer-credit screen
 
-This is **not yet claimed to be cycle-perfect or 1:1**. The largest remaining visual fidelity item is the cartridge's `$08CF` direct VIA transformed-web routine, plus some enemy-state and audio details.
+This is **not yet claimed to be cycle-perfect or 1:1**. V10 now reproduces the digital geometry of `$08CF` and the cartridge's render-first frame scheduling/latching structure. Remaining fidelity work is primarily exact Guardian/Creature/Portal state transitions in `$0CE1`, Dragon/Capture-Rod edge cases, status/Trophy-Room timing, and AY-3-8912 sound.
 
 ## ROM files are intentionally not included
 
@@ -138,4 +144,4 @@ They are covered by `.gitignore` on purpose.
 
 ## Project direction
 
-The next major fidelity step is to port cartridge routine `$08CF` instruction-by-instruction into abstract vector-beam commands. That should remove the remaining approximation in the longitudinal foreground web geometry.
+The next major fidelity step is `$0CE1`: replace the remaining approximate Guardian/Creature/Portal decisions with the cartridge state machine and its exact pseudo-random/table-driven choices. After that: Cosmic Dragon/Capture-Rod edge cases, exact status/Trophy-Room timing, then AY-3-8912 music/SFX synthesis.
