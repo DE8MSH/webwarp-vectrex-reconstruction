@@ -1,0 +1,34 @@
+name: Apply V9 exact 08CF patch
+
+on:
+  push:
+    paths:
+      - '.bootstrap/v9.patch.gz.b64'
+      - '.github/workflows/apply-v9.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply V9 patch
+        shell: bash
+        run: |
+          base64 --decode .bootstrap/v9.patch.gz.b64 | gzip --decompress > /tmp/v9.patch
+          git apply --check /tmp/v9.patch
+          git apply /tmp/v9.patch
+          python3 -m py_compile webwarp.py
+          test "$(sha256sum webwarp.py | awk '{print $1}')" = "202e3094f2f6e7bc5b1b28bbff7b1c5ddaa32b60eba534ab3162c85b577fbe62"
+      - name: Commit V9
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add webwarp.py
+          git commit -m "Port exact digital geometry of Web Warp routine 08CF"
+          git push
