@@ -1,165 +1,174 @@
 # Web Warp / Web Wars — reverse-engineering map
 
-This document is a compact working map for the native reconstruction. Addresses refer to the 8192-byte cartridge ROM (`$0000-$1FFF`). Semantic names are reconstruction names, not original source labels.
+This is the working map for the native reconstruction. Cartridge addresses are `$0000-$1FFF`; RAM is Vectrex `$C800+`. Semantic names are reconstruction names.
 
-## Cartridge / boot
+## Boot / cartridge
 
-- `$0000` cartridge header: `g GCE 1983`, title-music pointer `$1E87`, title `WEB WARP`
-- `$001D` cartridge entry and hidden programmer-credit gate
-- hidden credits at `$11D5`: William Hawkins, Duncan Muirhead, Patrick King, GT 1983
-- hidden gate uses Vectrex buttons 1+2+4
+- `$0000`: cartridge header `g GCE 1983`, title music `$1E87`, title `WEB WARP`
+- `$001D`: cartridge entry and hidden programmer-credit gate
+- hidden screen: William Hawkins, Duncan Muirhead, Patrick King, GT 1983
+- gate uses Vectrex buttons 1+2+4
 
-## Main loop
+## Exact frame order
 
-The per-frame order reconstructed from the cartridge is:
+The game loop at `$0048` is render-first:
 
 1. `Wait_Recal`
 2. `Do_Sound`
-3. button read
-4. joystick sampler `$1CDF`
-5. render/update frame `$0437`
-6. shot/death `$0B3F`
+3. `Read_Btns_Mask`
+4. custom joystick read `$1CDF`
+5. **`WW_RenderAndAdvanceFrame` `$0437`**
+6. player fire/death `$0B3F`
 7. player movement `$0B9A`
 8. bonus/high score `$0B14`
 9. Guardians/Creature/Portal `$0CE1`
 10. Dragon shot `$1028`
-11. web-line spawn `$0F54`
-12. sound engine `$1D2A`
-13. deterministic web-motion script `$1078`
+11. web-line allocation `$0F54`
+12. sound event engine `$1D2A`
+13. deterministic web script `$1078`
 14. player angle `$0FBF`
-15. world transforms `$0C75`
-16. BIOS counters
+15. world-coordinate transform/latch `$0C75`
+16. BIOS `Dec_Counters`
 17. Capture Rod `$0FCE`
-18. Cosmic Dragon trigger `$1104`
+18. Dragon trigger `$1104`
 19. Trophy Room 2 check `$0100`
 
-## Corrected major functions
+V10 follows this temporal structure: current/latched state is rendered first; movement, camera script, player angle and transformed coordinates then prepare the next frame.
 
-| Address | Reconstruction name | Meaning |
+## Major functions
+
+| Address | Name | Meaning |
 |---|---|---|
-| `$0100` | `WW_CheckTrophyRoom2` | original `$20`/20 bug check |
-| `$0239` | `WW_InitGameAndWeb` | motion tables, speed, initial web |
-| `$0437` | `WW_RenderAndAdvanceFrame` | central renderer/state advancement |
-| `$08CF` | `WW_DrawTransformedWebVector` | direct VIA transformed foreground-web routine; largest remaining fidelity item |
-| `$094F` | `WW_BuildDrawDisplacement` | camera/object draw displacement |
-| `$0976/$0979` | depth update | rounded 8x8/16-bit depth math |
+| `$0100` | `WW_CheckTrophyRoom2` | original `$20`/20 bug |
+| `$0239` | `WW_InitGameAndWeb` | web packet copy, runtime tables, speed, initial web fill |
+| `$0437` | `WW_RenderAndAdvanceFrame` | central renderer; also advances several depth/lifecycle values |
+| `$08CF` | `WW_DrawTransformedWebVector` | two foreground beam segments + transforms one web packet record |
+| `$094F` | `WW_BuildDrawDisplacement` | camera/object displacement into two `(dy,dx)` moves |
+| `$0976/$0979` | depth update | rounded multiplicative 16-bit radial motion |
 | `$099F` | `WW_RenderTrophyRoom` | Trophy Room renderer |
-| `$0A54` | `WW_UpdateCosmicDragon` | Dragon update |
-| `$0B14` | bonus/high score | extra lives + high score |
-| `$0B3F` | player fire/death | 9-shot pool, cooldown 8 |
-| `$0BBF` | lateral movement core | continuous motion across seven web segments |
-| `$0C75` | transform all | Hawk, six Drones, Creature, Portal |
-| `$0CC0` | transform coordinate | BIOS Rise/Run fixed-point rotation |
-| `$0CE1` | Guardian/Creature/Portal update | principal world-object logic |
-| `$0F1E` | collision | 3-axis threshold check returning Carry |
-| `$0F54` | `WW_SpawnWebLine` | web-line allocator, not enemy spawn |
+| `$0A54` | `WW_UpdateCosmicDragon` | Dragon render/update path |
+| `$0B14` | bonus/high score | extra lives + Vectrex high score |
+| `$0B3F` | player fire/death | nine-shot pool, cooldown 8 |
+| `$0BBF` | lateral movement core | continuous motion over seven web segments |
+| `$0C75` | transform all | writes transformed coordinates late in the frame |
+| `$0CC0` | transform coordinate | BIOS Rise/Run integer rotation |
+| `$0CE1` | world-object state machine | Guardians, Creature, collisions, Portal/Trophy transition |
+| `$0F1E` | entity/player collision | three-axis threshold test |
+| `$0F54` | `WW_SpawnWebLine` | allocates one free 3-byte web record |
 | `$0FBF` | player angle | seven-value table + web angle |
-| `$0FCE` | Capture Rod | 13-frame rod timer / Creature capture |
-| `$1028` | Dragon shot | projectile + 5x7 hit test |
-| `$106A/$1078` | web script | initialize/update deterministic `$191C` motion script |
-| `$10A9` | Portal spawn | separate Trophy Room entrance object |
+| `$0FCE` | Capture Rod | Button 3, `$0D` timer, 325-point capture |
+| `$1028` | Dragon shot | projectile and 5x7 hit test |
+| `$106A/$1078` | web motion | deterministic `$191C` script |
+| `$10A9` | Portal spawn | Trophy Room entrance |
 | `$1104` | Dragon trigger | Cosmic Dragon activation |
 | `$1D2A` | sound engine | music/SFX dispatch |
 
-## Object/RAM map
+## RAM / object map
 
-- `$C900` initial 3-byte moving web-line record
-- `$C903-$C91A` eight recycled 3-byte web-line records
-- `$C94F-$C9BA` exactly six 18-byte Guardian Drone records
-- `$C9BB-$C9CC` current Fantasy Creature, separate from Guardians
-- `$C9CD...` Cosmic Dragon
-- `$C9DE...` Hawk King/player record
-- `$C9F0` capture-pending state
-- `$C9F1-$CA41` exactly nine 9-byte blaster-shot records
-- `$CB22...` Trophy Room portal, separate from Creature
-- `$CAD6/$CAE1` player 1/player 2 score/display state
+- `$C900`: initial 3-byte moving web record
+- `$C903-$C91A`: eight additional 3-byte web records
+- `$C92F-$C94E`: **eight 4-byte foreground-web displacement entries**
+- `$C94F-$C9BA`: exactly six 18-byte Guardian Drone records
+- `$C9BB-$C9CC`: Fantasy Creature, 18 bytes
+- `$C9CD...`: Cosmic Dragon state
+- `$C9DE...`: Hawk King/player state
+- `$C9F0`: post-capture / portal state
+- `$C9F1-$CA41`: exactly nine 9-byte blaster-shot records
+- `$CA43/$CA60/$CA7D`: scaled web-motion tables
+- `$CA99...`: cumulative web vertices
+- `$CAB9...`: transformed runtime copy of the `$1177` web packet
+- `$CB22...`: Trophy Room portal
+- `$CAD6/$CAE1`: P1/P2 score/display state
 
-## Web geometry
+## Web geometry and `$08CF`
 
-`$1177` is the base U/semicircle mode-vector list. Its cumulative vertices are used to construct the seven web segments and the runtime movement tables.
+`$1177` is the original U/semicircle mode-vector packet. Its eight cumulative vertices define seven traversable segments.
 
-The game uses one initial web-line record plus eight recycled records. A record starts at depth `$0280`; its depth grows using speed-dependent integer multiplication. Ring spacing comes from `$118F` and uses the active speed.
+`$0239` copies the packet into RAM at `$CAB9`. Rendering is pipelined: a frame consumes the previous transformed RAM packet while `$08CF` simultaneously transforms the source packet record-by-record for the next frame.
 
-The visible web motion is **not random**. `$191C` is a fixed sequence of 7-byte records:
+The foreground web is **not** generated by connecting moving rings together. The caller builds `$C92F-$C94E` as eight entries, each containing two relative `(dy,dx)` moves from `$094F`. `$08CF` unblanks the beam and draws those two segments at fixed scale `$E0`. Therefore the longitudinal web is eight rails x two visible segments.
 
-- duration
-- signed 16-bit delta A
-- signed 16-bit delta B
-- signed 16-bit web-angle/base delta
+The moving 3-byte web records are a separate pass. Each active record advances its 16-bit depth inside `$0437` before drawing. During normal play records are not artificially deleted at `$E0`; once allocated they retain their 16-bit depth state and may naturally wrap. `$0F54` only allocates from the free-record stack. The special `$E0` free behavior belongs to the initial fill in `$0239`.
 
-`$1078` advances through the records and loops at the zero-duration terminator.
+Moving records are traversed in fixed RAM order (`$C900`, `$C903`, ...), not depth-sorted.
 
-Hawk lateral movement does not make the web camera follow the Hawk. Hawk orientation is separately derived from `directionIndex >> 2` plus the current web-angle state.
+Ring intensity comes from the original `MUL`/`ADCA` expression, approximately `round(depth_hi * $50 / 256) + $30`.
 
-After the normal moving ring pool is drawn, the original renderer performs another web pass at fixed scale `$E0` and calls `$08CF`. V8 approximates this foreground continuation, but `$08CF` itself is still the main target for a bit/beam-faithful port.
+The visible web motion itself is deterministic. `$191C` contains 15 seven-byte records: duration + three signed 16-bit deltas. Hawk left/right movement does not make the camera follow the Hawk.
+
+## Coordinate latching
+
+`$0C75` runs near the end of each frame. It computes Rise/Run pairs and writes transformed coordinates for Hawk, six Guardians, Creature and Portal. The following `$0437` consumes these stored bytes.
+
+V10 therefore stores transformed coordinates in entity state. Rendering does not recompute them from newly mutated world coordinates. This removes an important one-frame mismatch present in earlier versions.
 
 ## Player / movement
 
-The seven player/web orientation values at `$18BB` are:
+Player/web orientation table `$18BB`:
 
 `+17, +13, +7, 0, -7, -13, -17`
 
-Runtime tables derived from the web segment deltas provide different movement granularity:
+Runtime movement tables derived from the seven `$1177` deltas use different granularity:
 
-- Hawk: delta x8 -> 32 steps per segment
-- Guardians: delta x16 -> 16 steps per segment
-- Creature: delta x32 -> 8 steps per segment
+- Hawk: delta x8 -> 32 substeps per segment
+- Guardians: delta x16 -> 16 substeps per segment
+- Creature: delta x32 -> 8 substeps per segment
 
-The native reconstruction keeps these as fixed-width integer world coordinates before final raster display mapping.
+Hawk depth starts at `$E000`.
 
 ## Original vector assets
 
 - `$111C` Trophy Room entrance portal
 - `$112C` patterned X-cross
 - `$1145` player explosion dot list
-- `$1177` web semicircle/U
-- `$11B9` Guardian Drone star/mine
+- `$1177` web U/semicircle
+- `$11B9` Guardian Drone
 - `$1225` 40 pointers = 20 Creature/Trophy species x two frames
-- `$1986` Hawk King animation pointer sequence
-- `$1AAE` Cosmic Dragon animation pointer sequence
+- `$1986` Hawk animation pointer sequence
+- `$1AAE` Dragon animation sequence
 - `$1BCA` Dragon head
 - `$1BD7` Dragon shot
 - `$1BE9` Trophy Room hexagon
 - `$1BF7` Trophy Room layout
 
-The ROM decoder in `tools/web_warp_rom_decoder.py` extracts the supported vector lists into `web_warp_vectors.json` from a local cartridge dump.
-
 ## Capture / Trophy Room
 
-Button 3 activates the Capture Rod for `$0D` frames. Capture checks Creature depth proximity and a BIOS `Obj_Hit` gate. Successful capture scores 325 and enables the later Portal sequence.
+Button 3 is processed late in the frame. It sets the Capture Rod counter to `$0D`. Capture checks depth proximity, then BIOS `Obj_Hit(16,8)`. Success scores 325 and enables the Portal sequence.
 
-Entering the portal increments Trophy progression and scores 750.
+Portal entry scores 750 and increments Trophy progression.
 
-The original cartridge contains a documented code bug at `$0100`: it compares the count to hexadecimal `$20` (32 decimal) where the intended threshold was apparently decimal 20. The reconstruction can preserve the original behavior or use the fixed threshold.
+The original `$0100` bug compares to hexadecimal `$20` (=32), not decimal 20. The port can preserve or fix it.
 
 ## Scoring / lives
 
-Packed-decimal score constants at `$1163`:
+Packed-decimal constants at `$1163`:
 
-- Guardian: 75 base points plus speed bonus
+- Guardian: 75 base + speed-dependent bonus
 - Creature capture: 325
 - Trophy Room entry: 750
 
 Starting lives: 5.
 
-ROM bonus thresholds at `$18F2`:
+Bonus thresholds at `$18F2`:
 
 `25000, 50000, 100000, 250000, 500000, 999999`
 
 ## Sound
 
-The custom event engine begins around `$1D2A`; the jump/data table is at `$1EF1`. Known event bits from call sites include:
+Custom event dispatch begins around `$1D2A`; jump/data table `$1EF1`.
 
-- `$08` blaster fire
-- `$10` Cosmic Dragon activation/attack
+Known event bits:
+
+- `$08` blaster
+- `$10` Cosmic Dragon
 - `$20` Guardian destroyed
-- `$40` Hawk King hit/death
-- `$80` successful Capture Rod hit
+- `$40` Hawk hit/death
+- `$80` Capture Rod success
 
-Exact AY-3-8912 reproduction remains future work.
+Exact AY-3-8912 synthesis remains unfinished.
 
 ## Current fidelity boundary
 
-V8 already uses original vector assets, ROM-derived integer world movement, BIOS Rise/Run rotation math, `$094F` displacement reconstruction, the speed/ring pool, deterministic web script and fixed-$E0 foreground continuation.
+**V10** includes the exact digital `$08CF` geometry, `$094F`, BIOS Rise/Run math, render-first scheduling, transformed-coordinate latches, original moving-web record order and runtime 16-bit depth behavior.
 
-It is deliberately **not** labelled cycle-perfect or 1:1 yet. The most important remaining visual task is an instruction-by-instruction abstraction of `$08CF` into beam commands, followed by exact Guardian state transitions and sound synthesis.
+The largest remaining gameplay approximation is now `$0CE1`: Guardian/Creature/Portal state transitions and their exact random/table-driven choices. After that: Dragon/Capture-Rod edge cases, status/Trophy-Room timing, and exact AY sound synthesis.
