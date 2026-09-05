@@ -1,9 +1,25 @@
 #!/usr/bin/env python3
 """
 Web Warp / Web Wars (Vectrex, 1983)
-Native Python 3 vector reconstruction — V8 foreground-web correction
+Native Python 3 vector reconstruction — V9 exact $08CF web geometry
 
-V8 fixes the truncated foreground of the Web of Fantasy.
+V9 replaces the last major invented web-perspective path with the digital geometry of cartridge $08CF.
+
+Critical V9 changes
+-------------------
+* the web packet in RAM is modeled as eight transformed mode-vector records
+* packet transformation is one-frame pipelined, like $08CF writing CAB9 while the
+  renderer consumes the previous CAB9 contents
+* the exact 32-byte C92F..C94E displacement table is rebuilt from cumulative
+  transformed web deltas
+* moving U-rings use displacement entry 0 plus the already-transformed packet
+* the old fake ring-to-ring connectors are removed completely
+* foreground web rails are now the real eight $08CF polylines: two visible
+  $094F-derived segments per rail at fixed scale $E0
+* ring brightness follows the ROM formula round(depth_hi*$50/256)+$30
+* foreground rails use the original fixed intensity $30
+
+Previously V8:
 
 Important V8 behavior
 ---------------------
@@ -181,6 +197,20 @@ FAINT = (54, 54, 54)
 DIM = (100, 100, 100)
 MID = (170, 170, 170)
 WHITE = (238, 238, 238)
+
+
+def intensity_color(value):
+    """Map Vectrex 7-bit-ish intensity to neutral desktop luminance."""
+    value = clamp(int(value), 0, 0x7F)
+    g = clamp(int(round(value * 255.0 / 0x7F)), 0, 255)
+    return (g, g, g)
+
+
+def ring_intensity_byte(depth_hi):
+    """ROM $0663: MUL by $50, rounded high byte, then ADCA #$30."""
+    product = (u8(depth_hi) * 0x50) & 0xFFFF
+    rounded_hi = ((product >> 8) + (1 if product & 0x80 else 0)) & 0xFF
+    return u8(rounded_hi + 0x30)
 
 
 # ---------------------------------------------------------------------------
@@ -896,6 +926,11 @@ class Game:
         self.web_script_i = 0
         self.web_script_timer = self.a.web_script[0][0] if self.a.web_script else 1
 
+        # InitGameAndWeb copies the original $1177 packet to CAB9. $08CF then
+        # consumes that RAM packet while overwriting it with the newly transformed
+        # packet for the NEXT frame. Angle zero is identity, so raw == transformed.
+        self.web_packet = self.original_web_packet()
+
         # Original $0239 does not enter gameplay with a single ring. It repeatedly
         # advances/spawns the 3-byte web-line records until the oldest one passes
         # the $E0 depth threshold. Reproduce that startup fill now.
@@ -1490,121 +1525,152 @@ class Game:
     # Rendering helpers
     # ------------------------------------------------------------------
 
-    def web_initial_vertex_displacement(self):
-        """
-        The copied $1177 list starts with:
-            mode=$00, dy=$30, dx=$50
-        But RAM_C887 points three bytes later, at the first DRAW record.
+    def original_web_packet(self):
+        """Return the eight $1177 records as signed (mode,dy,dx) tuples."""
+        packet = []
+        for c in self.a.vector("1177_web_semicircle"):
+            packet.append((u8(c["mode"]), s8(c["dy"]), s8(c["dx"])))
+        if len(packet) != 8:
+            raise RuntimeError("$1177 packet is not eight records")
+        return packet
 
-        Therefore the initial MOVE endpoint is transformed separately and used
-        to build the two C92F positioning vectors via $094F.
+    def transform_web_packet(self, angle):
         """
-        first = self.a.vector("1177_web_semicircle")[0]
-        ty, tx = self.bm.transform_pair(
-            s8(first["dy"]),
-            s8(first["dx"]),
-            self.camera_angle_byte(),
-        )
-        return build_draw_displacement(
-            hi(self.camera_a),
-            hi(self.camera_b),
-            ty,
-            tx,
-        )
+        Computational half of $08CF.
 
-    def web_ring_origin(self, depth):
+        $08CF copies each mode byte unchanged. For mode <= 0 it transforms dy/dx:
+          outY = Xform_Rise(dy) + Xform_Run(dx)
+          outX = Xform_Rise(dx) - Xform_Run(dy)
+        A positive mode is the terminator and is not a coordinate record. $1177
+        contains exactly eight non-positive records before the shared $01 sentinel.
         """
-        Exact high-level equivalent of:
-          Reset0Ref
-          camera pre-move @ $7F
-          scale = depth_hi
-          Mov_Draw_VL(C92F)
-          Mov_Draw_VL(C931)
+        out = []
+        for mode, dy, dx in self.original_web_packet():
+            if s8(mode) <= 0:
+                ty, tx = self.bm.transform_pair(dy, dx, angle)
+                out.append((mode, ty, tx))
+            else:
+                out.append((mode, dy, dx))
+        return out
+
+    def web_displacement_table(self, packet=None):
         """
-        p1, p2 = self.web_initial_vertex_displacement()
+        Rebuild RAM $C92F..$C94E exactly at the digital level.
+
+        Caller $06D8 accumulates the eight transformed packet deltas with ADDA
+        and ADDB (independent modulo-256 byte additions). For every cumulative
+        vertex it calls $094F, which writes two (dy,dx) beam vectors = 4 bytes.
+        Eight vertices * four bytes = the exact 32-byte table ending at $C94E.
+        """
+        if packet is None:
+            packet = self.web_packet
+
+        acc_y = 0
+        acc_x = 0
+        table = []
+        for mode, dy, dx in packet:
+            # Coordinates are accumulated regardless of the mode byte; these are
+            # the eight records preceding the positive terminator at $CAD1.
+            acc_y = u8(acc_y + u8(dy))
+            acc_x = u8(acc_x + u8(dx))
+            table.append(build_draw_displacement(
+                hi(self.camera_a), hi(self.camera_b), s8(acc_y), s8(acc_x)
+            ))
+
+        if len(table) != 8:
+            raise RuntimeError("web displacement table must contain eight entries")
+        return table
+
+    def web_ring_origin_from_table(self, depth, displacement_table):
+        """Normal ring path: camera pre-move then C92F/C931 at depth_hi scale."""
+        p1, p2 = displacement_table[0]
         pos = self.camera_pre_move((CX, CY))
         scale = hi(depth)
         pos = self.beam_move(pos, p1[0], p1[1], scale)
         pos = self.beam_move(pos, p2[0], p2[1], scale)
         return pos
 
-    def web_ring_points(self, depth):
-        """
-        Screen points of the seven DRAW records only.
-
-        The first point is the separately positioned initial vertex. This is
-        the structure used by the real ring Draw_VLp path.
-        """
-        cmds = self.a.vector("1177_web_semicircle")
-        pos = self.web_ring_origin(depth)
+    def web_ring_points_from_table(self, depth, displacement_table, packet=None):
+        """Return the eight screen-space vertices of one moving U-ring."""
+        if packet is None:
+            packet = self.web_packet
+        pos = self.web_ring_origin_from_table(depth, displacement_table)
         pts = [(int(round(pos[0])), int(round(pos[1])))]
         scale = hi(depth)
-        angle = self.camera_angle_byte()
 
-        for c in cmds[1:]:
-            # cmds[1:] are the seven $FF draw records.
-            dy = s8(c["dy"])
-            dx = s8(c["dx"])
-            dy, dx = self.bm.rotate_delta(dy, dx, angle)
+        # Draw_VLp starts at C887=CABC, i.e. record 1. Record 0's move was
+        # already converted into C92F/C931 positioning. No rotation happens here:
+        # CAB9 already contains the transformed packet produced by prior $08CF.
+        for mode, dy, dx in packet[1:]:
             pos = self.beam_move(pos, dy, dx, scale)
             pts.append((int(round(pos[0])), int(round(pos[1]))))
-
         return pts
+
+    def draw_transformed_web_packet(self, r, origin, depth, packet, color):
+        """Equivalent screen geometry of Draw_VLp(C887) for the web packet."""
+        pos = (float(origin[0]), float(origin[1]))
+        scale = hi(depth)
+        for mode, dy, dx in packet[1:]:
+            nxt = self.beam_move(pos, dy, dx, scale)
+            if s8(mode) < 0:
+                r.line(pos, nxt, color)
+            pos = nxt
+        return pos
+
+    def foreground_web_rails(self, displacement_table):
+        """
+        Exact digital geometry produced by $08CF's beam half.
+
+        For each of eight cumulative web vertices, the caller has already done a
+        blank camera pre-move at scale $7F. $08CF then unblanks the beam and draws
+        the two $094F vectors consecutively at fixed scale $E0.
+        """
+        rails = []
+        for p1, p2 in displacement_table:
+            p0 = self.camera_pre_move((CX, CY))
+            p_mid = self.beam_move(p0, p1[0], p1[1], 0xE0)
+            p_end = self.beam_move(p_mid, p2[0], p2[1], 0xE0)
+            rails.append((p0, p_mid, p_end))
+        return rails
 
     def draw_web(self, r: Renderer):
         """
-        Moving ring path reconstructed from $0634:
+        V9 reconstruction of the two real web renderer passes.
 
-          camera pre-move (C8A0,C8A2) at scale $7F
-          ring depth update via $0976
-          scale = depth_hi
-          two positioning moves from C92F
-          Draw_VLp at RAM_C887 = transformed packet + 3
+        Pass 1 ($0630): moving depth rings. They use the previous-frame transformed
+        CAB9 packet and displacement entry C92F to position the omitted first move.
 
-        Thus the $00,$30,$50 initial MOVE is NOT drawn/executed a second time.
+        Pass 2 ($0695): eight foreground rails. Each is two visible segments from
+        $094F at fixed scale $E0. During those two hardware timer intervals $08CF
+        transforms one original $1177 record and writes it back to CAB9 for the
+        next frame. We model that write after drawing, preserving the pipeline.
         """
+        packet = self.web_packet
+        displacement_table = self.web_displacement_table(packet)
+
         rings = sorted(
             [rec for rec in self.web_lines if rec["active"]],
             key=lambda q: hi(q["depth"])
         )
 
-        all_pts = []
-
         for rec in rings:
             scale = hi(rec["depth"])
-            origin = self.web_ring_origin(rec["depth"])
-            intensity = DIM if scale < 0x70 else MID
-
-            # Draw only first-draw-record onward, matching C887 = buffer + 3.
-            r.original_mode_list(
-                self.a.vector("1177_web_semicircle")[1:],
-                origin,
-                scale,
-                self.camera_angle_byte(),
-                intensity,
+            origin = self.web_ring_origin_from_table(rec["depth"], displacement_table)
+            z = ring_intensity_byte(scale)
+            self.draw_transformed_web_packet(
+                r, origin, rec["depth"], packet, intensity_color(z)
             )
 
-            all_pts.append(self.web_ring_points(rec["depth"]))
+        # No artificial ring-to-ring connections. The cartridge's separate $08CF
+        # pass is the longitudinal web. Intensity_a is loaded with #$30 beforehand.
+        rail_color = intensity_color(0x30)
+        for p0, p_mid, p_end in self.foreground_web_rails(displacement_table):
+            r.line(p0, p_mid, rail_color)
+            r.line(p_mid, p_end, rail_color)
 
-        # $08CF is the one remaining specialized beam path. Between ordinary
-        # rings we can safely connect identical original $1177 vertices.
-        for ring0, ring1 in zip(all_pts, all_pts[1:]):
-            for p0, p1 in zip(ring0, ring1):
-                r.line(p0, p1, FAINT)
-
-        # ORIGINAL RENDERER FACT:
-        # After the moving ring pool has been drawn, Web Warp performs a second
-        # web pass and explicitly sets VIA scale to $E0 before calling $08CF.
-        #
-        # V7 omitted that entire foreground continuation, so the rails stopped
-        # visibly at the nearest live ring. Until $08CF itself is fully emulated,
-        # extend each exact rail from the nearest ring to the corresponding
-        # fixed-$E0 endpoint. Do NOT draw another U cross-ring there.
-        if all_pts:
-            front_pts = self.web_ring_points(0xE000)
-            nearest = all_pts[-1]
-            for p0, p1 in zip(nearest, front_pts):
-                r.line(p0, p1, MID)
+        # Computational side of $08CF: overwrite CAB9 one record per rail. The
+        # current frame consumed the old packet; the new one is visible next frame.
+        self.web_packet = self.transform_web_packet(self.camera_angle_byte())
 
 
     def draw_entity_model(
@@ -1893,7 +1959,8 @@ class Game:
             f"B5=${self.web_angle_word:04X} angleByte=${self.camera_angle_byte():02X}",
             f"A0=${self.camera_a:04X} A2=${self.camera_b:04X}",
             f"script {self.web_script_i}/{len(self.a.web_script)} t={self.web_script_timer} (deterministic)",
-            f"web front rail target=$E000",
+            f"$08CF rails=8 x 2 segments @ scale $E0",
+            f"web packet lag angle=${self.camera_angle_byte():02X}",
             f"hawk seg={self.hawk.segment} sub={self.hawk.subindex:02d}/32",
             f"hawk world Y=${self.hawk.world_y:04X} X=${self.hawk.world_x:04X}",
             f"hawk xform=({transformed[0]:+d},{transformed[1]:+d})",
@@ -2034,28 +2101,39 @@ def self_test(a: Assets):
     hp, _, _ = g.object_origin(g.hawk)
     assert hp != (CX, CY)
 
-    # Ring initial positioning: with zero camera the separately transformed
-    # first $1177 MOVE must be equivalent to moving to (48,80), not executing
-    # that MOVE again inside Draw_VLp.
+    # $08CF packet transform: angle zero is identity.
     g.camera_a = 0
     g.camera_b = 0
     g.web_angle_word = 0
-    _p1, _p2 = g.web_initial_vertex_displacement()
-    assert _p1 == (24, 40), (_p1, _p2)
-    assert _p2 == (24, 40), (_p1, _p2)
+    raw_packet = g.original_web_packet()
+    assert g.transform_web_packet(0) == raw_packet
+    assert len(raw_packet) == 8
 
-    _ring = g.web_ring_points(0x4000)
-    assert len(_ring) == 8
-    # U is symmetric in Y endpoints under angle 0.
-    assert _ring[0][1] == _ring[-1][1]
+    # C92F..C94E = eight entries * two vectors * two bytes = 32 bytes.
+    disp = g.web_displacement_table(raw_packet)
+    assert len(disp) == 8
+    assert disp[0] == ((24, 40), (24, 40)), disp[0]
+    assert disp[-1] == ((24, -40), (24, -40)), disp[-1]
 
-    # Foreground continuation has eight corresponding endpoints at fixed $E0.
-    _front = g.web_ring_points(0xE000)
-    assert len(_front) == 8
-    # It must extend farther from center than a mid-depth ring.
-    _ring_span = max(p[0] for p in _ring) - min(p[0] for p in _ring)
-    _front_span = max(p[0] for p in _front) - min(p[0] for p in _front)
-    assert _front_span > _ring_span
+    # Normal ring uses entry 0 and the seven already-transformed draw records.
+    ring = g.web_ring_points_from_table(0x4000, disp, raw_packet)
+    assert len(ring) == 8
+    assert ring[0][1] == ring[-1][1]
+
+    # $08CF longitudinal pass is exactly 8 rails, each with two visible segments.
+    rails = g.foreground_web_rails(disp)
+    assert len(rails) == 8
+    for rail in rails:
+        assert len(rail) == 3
+
+    # At camera=0, the two $08CF halves are collinear and reach the $E0-scaled
+    # cumulative web vertices. First/last endpoints span exactly 560 logical px.
+    front_span = abs(rails[0][2][0] - rails[-1][2][0])
+    assert abs(front_span - 560.0) < 1e-9, front_span
+
+    # Ring intensity is the actual $0663 MUL/ADCA formula.
+    assert ring_intensity_byte(0x00) == 0x30
+    assert ring_intensity_byte(0xE0) == 0x76
 
     # Original-style prefill should start play with several receding rings.
     active_depths = sorted(
@@ -2080,9 +2158,10 @@ def self_test(a: Assets):
     print("full $E0 web width:", 160 * 0xE0 * HW_TO_PIXELS, "logical px")
     print("$094F independent ASRA/ASRB: OK")
     print("camera pre-move @ $7F: OK")
-    print("$1177 initial MOVE separated from Draw_VLp: OK")
+    print("$08CF packet pipeline + C92F displacement table: OK")
     print("$191C web motion script: deterministic, not random")
-    print("fixed-$E0 foreground rail continuation: OK")
+    print("$08CF foreground rails: 8 x 2 visible segments @ $E0")
+    print("ring intensity $30..$76 formula: OK")
     print("startup web prefill depths:",
           ["$%04X" % d for d in active_depths])
     print("window line clipping: enabled")
@@ -2147,7 +2226,7 @@ def main():
 
     pygame.init()
     screen = pygame.display.set_mode((W, H))
-    pygame.display.set_caption("Web Warp — Python vector reconstruction V8 — foreground web fixed")
+    pygame.display.set_caption("Web Warp — Python vector reconstruction V9 — exact $08CF web geometry")
     clock = pygame.time.Clock()
 
     fonts = (
