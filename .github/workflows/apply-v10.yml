@@ -1,0 +1,34 @@
+name: Apply V10 frame scheduler patch
+
+on:
+  push:
+    paths:
+      - '.bootstrap/v10.patch.gz.b64'
+      - '.github/workflows/apply-v10.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply V10 patch
+        shell: bash
+        run: |
+          base64 --decode .bootstrap/v10.patch.gz.b64 | gzip --decompress > /tmp/v10.patch
+          git apply --check /tmp/v10.patch
+          git apply /tmp/v10.patch
+          python3 -m py_compile webwarp.py
+          test "$(sha256sum webwarp.py | awk '{print $1}')" = "07ec7ad2195a5a234c07483e176b79da79f13284bb9a24e505eebf3c759a0a87"
+      - name: Commit V10
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add webwarp.py
+          git commit -m "Match original render-first frame scheduler and transform latches"
+          git push
