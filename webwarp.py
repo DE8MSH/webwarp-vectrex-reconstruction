@@ -1,9 +1,23 @@
 #!/usr/bin/env python3
 """
 Web Warp / Web Wars (Vectrex, 1983)
-Native Python 3 vector reconstruction — V9 exact $08CF web geometry
+Native Python 3 vector reconstruction — V10 original frame scheduler + transform latches
 
-V9 replaces the last major invented web-perspective path with the digital geometry of cartridge $08CF.
+V10 fixes a major temporal mismatch: the cartridge renders current/latched state first, then runs gameplay and world transforms for the next frame.
+
+Critical V10 changes
+--------------------
+* PLAY frames now have explicit render and post-render phases
+* the main loop draws before gameplay mutation, matching $0048
+* entity transformed coordinates are latched at the end of a frame and consumed by the next render
+* Button-4 fire and Button-3 Capture Rod are latched during input and applied after rendering, so new effects appear on the next frame
+* projectile depth, moving-web depth, Guardian depth, Creature depth and Portal depth advance in the renderer-side phase where the ROM advances them
+* runtime web-line records are no longer incorrectly freed at depth > $E0; after startup fill they remain active and naturally wrap in 16-bit depth, matching the fixed record pool
+* moving web records are rendered in cartridge RAM order instead of depth-sorted order
+* player model angle is latched after the web script, like WW_UpdatePlayerAngle
+* V9 exact digital $08CF web geometry is retained
+
+Previously V9:
 
 Critical V9 changes
 -------------------
@@ -711,6 +725,11 @@ class MovingEntity:
 
     phase: int = 0
 
+    # $0C75 writes transformed high-byte coordinates late in each frame.
+    # $0437 consumes these latched bytes on the NEXT frame.
+    transformed_y: int = 0
+    transformed_x: int = 0
+
     @property
     def segment(self):
         return clamp(self.direction_index >> 2, 0, 6)
@@ -722,6 +741,8 @@ class Shot:
     depth: int = 0xE000
     world_y: int = 0
     world_x: int = 0
+    transformed_y: int = 0
+    transformed_x: int = 0
 
 
 @dataclass
@@ -753,6 +774,11 @@ class Game:
         self.hawk_death_timer = 0
         self.hawk_state = 1
         self.speed = 4
+        self.player_angle_latched = 0
+
+        # Input is sampled before $0437, but fire/rod routines run after it.
+        self.pending_fire = False
+        self.pending_rod = False
 
         self.guardians = [MovingEntity() for _ in range(GUARDIAN_COUNT)]
         self.creature = MovingEntity()
@@ -899,6 +925,8 @@ class Game:
         self.hawk_rod_timer = 0
         self.hawk_death_timer = 0
         self.speed = 4
+        self.pending_fire = False
+        self.pending_rod = False
 
         self.guardians = [MovingEntity() for _ in range(GUARDIAN_COUNT)]
         for _ in range(clamp(2 + (self.p.trophies & 0x7F) // 3, 2, 6)):
@@ -931,6 +959,12 @@ class Game:
         # packet for the NEXT frame. Angle zero is identity, so raw == transformed.
         self.web_packet = self.original_web_packet()
 
+        # Seed the same kind of transformed-coordinate state that $0C75 will
+        # maintain at the end of later frames. The first renderer therefore has
+        # valid latched values rather than recomputing live world coordinates.
+        self.update_player_angle_latch()
+        self.latch_all_world_transforms()
+
         # Original $0239 does not enter gameplay with a single ring. It repeatedly
         # advances/spawns the 3-byte web-line records until the oldest one passes
         # the $E0 depth threshold. Reproduce that startup fill now.
@@ -944,15 +978,38 @@ class Game:
         # TransformAllWorldCoordinates loads direct byte C8B5.
         return hi(self.web_angle_word)
 
-    def player_model_angle_byte(self):
-        # WW_UpdatePlayerAngle: table[directionIndex>>2] + byte C8B5.
+    def update_player_angle_latch(self):
+        """Native $0FBF: seven-value table + current C8B5 angle byte."""
         base = self.a.player_angles[self.hawk.segment]
-        return u8(base + s8(self.camera_angle_byte()))
+        self.player_angle_latched = u8(base + s8(self.camera_angle_byte()))
 
-    def transform_world(self, e: MovingEntity):
+    def player_model_angle_byte(self):
+        return self.player_angle_latched
+
+    def transform_world_live(self, e: MovingEntity):
         y = s8(hi(e.world_y))
         x = s8(hi(e.world_x))
         return self.bm.transform_pair(y, x, self.camera_angle_byte())
+
+    def latch_entity_transform(self, e: MovingEntity):
+        e.transformed_y, e.transformed_x = self.transform_world_live(e)
+
+    def latch_all_world_transforms(self):
+        """
+        Native $0C75 phase. These bytes are deliberately stored, not queried
+        live by the renderer. That preserves the cartridge's one-frame state
+        relationship between motion/script updates and drawing.
+        """
+        self.latch_entity_transform(self.hawk)
+        for g in self.guardians:
+            if g.active or g.state != 0:
+                self.latch_entity_transform(g)
+        if self.creature.active:
+            self.latch_entity_transform(self.creature)
+        if self.portal.active:
+            self.latch_entity_transform(self.portal)
+        if self.dragon.active:
+            self.latch_entity_transform(self.dragon)
 
     def beam_move(self, pos, dy, dx, scale):
         """One native relative Vectrex move mapped into portrait pixels."""
@@ -986,7 +1043,7 @@ class Game:
           $094F -> two relative vectors
           Mov_Draw_VL twice @ scale depth_hi
         """
-        ty, tx = self.transform_world(e)
+        ty, tx = e.transformed_y, e.transformed_x
 
         p1, p2 = build_draw_displacement(
             hi(self.camera_a),
@@ -1111,23 +1168,21 @@ class Game:
         v = self.a.web_delay[i]
         return 1 if v == 0 else v
 
-    def update_web_lines(self):
-        for rec in self.web_lines:
-            if not rec["active"]:
-                continue
-            rec["depth"] = advance_depth(rec["depth"], self.speed, False)
-            if hi(rec["depth"]) > 0xE0:
-                rec["active"] = False
-
+    def spawn_web_line_post_render(self):
+        """Native $0F54 allocation phase, intentionally after the renderer."""
         if self.web_spawn_timer:
             self.web_spawn_timer -= 1
-        else:
-            for rec in self.web_lines[1:]:
-                if not rec["active"]:
-                    rec["active"] = True
-                    rec["depth"] = 0x0280
-                    break
-            self.web_spawn_timer = self.current_web_delay()
+            return
+
+        for rec in self.web_lines[1:]:
+            if not rec["active"]:
+                rec["active"] = True
+                rec["depth"] = 0x0280
+                self.web_spawn_timer = self.current_web_delay()
+                return
+
+        # Original free-list returns null once every pool record is active.
+        # Do not fabricate recycling/deactivation here.
 
     # ------------------------------------------------------------------
     # Entities
@@ -1155,6 +1210,8 @@ class Game:
                 s.depth = self.hawk.depth
                 s.world_y = self.hawk.world_y
                 s.world_x = self.hawk.world_x
+                s.transformed_y = self.hawk.transformed_y
+                s.transformed_x = self.hawk.transformed_x
                 self.hawk_fire_cd = SHOT_COOLDOWN
                 return
 
@@ -1162,15 +1219,37 @@ class Game:
         if self.state == "PLAY" and self.hawk_state > 0:
             self.hawk_rod_timer = CAPTURE_ROD_FRAMES
 
-    def update_shots(self):
-        for s in self.shots:
-            if not s.active:
+    def render_advance_shots(self):
+        """Projectile depth mutation belongs to $0437, before later gameplay."""
+        for shot in self.shots:
+            if not shot.active:
                 continue
-            # Renderer uses a separate scale byte around $10 for shot radial
-            # movement; preserve the same multiplicative direction.
-            s.depth = advance_depth(s.depth, 0x10, True)
-            if s.depth <= 0x0500:
-                s.active = False
+            shot.depth = advance_depth(shot.depth, 0x10, True)
+            if shot.depth <= 0x0500:
+                shot.active = False
+
+    def render_advance_web_depths(self):
+        """
+        $0437 advances every active 3-byte web record before drawing it. Runtime
+        records are NOT freed at $E0 here; they keep their 16-bit state and wrap.
+        The only explicit >$E0 free happens during $0239 startup prefill.
+        """
+        for rec in self.web_lines:
+            if rec["active"]:
+                rec["depth"] = advance_depth(rec["depth"], self.speed, False)
+
+    def render_advance_guardian_depths(self):
+        for g in self.guardians:
+            if g.active and g.state > 0:
+                g.depth = advance_depth(g.depth, self.speed, False)
+
+    def render_advance_creature_depth(self):
+        if self.creature.active:
+            self.creature.depth = advance_depth(self.creature.depth, self.speed, False)
+
+    def render_advance_portal_depth(self):
+        if self.portal.active:
+            self.portal.depth = advance_depth(self.portal.depth, self.speed, False)
 
     def update_guardians(self):
         for g in self.guardians:
@@ -1184,9 +1263,8 @@ class Game:
 
             g.phase = u8(g.phase + 1)
 
-            # Guardian radial/depth movement uses current speed in the normal
-            # forward state.
-            g.depth = advance_depth(g.depth, self.speed, False)
+            # Radial/depth movement already occurred in the renderer phase,
+            # matching $0437. This phase handles AI/state transitions only.
 
             # The original AI changes segment motion in discrete signed steps.
             # Exact decision timing is one of the remaining unfinished labels;
@@ -1211,7 +1289,7 @@ class Game:
         if not self.creature.active:
             return
 
-        self.creature.depth = advance_depth(self.creature.depth, self.speed, False)
+        # Depth was advanced in the renderer phase.
         if self.frame % 6 == 0:
             d = self.rng.choice((-1, 0, 0, 1))
             if d:
@@ -1269,7 +1347,7 @@ class Game:
         if not self.portal.active:
             return
 
-        self.portal.depth = advance_depth(self.portal.depth, self.speed, False)
+        # Depth was advanced in the renderer phase.
         if hi(self.portal.depth) > 0xE0:
             if (
                 abs(s8(hi(self.portal.world_y)) - s8(hi(self.hawk.world_y))) <= 8
@@ -1390,31 +1468,42 @@ class Game:
     # Frame update
     # ------------------------------------------------------------------
 
-    def update_play(self, keys):
+    def update_player_fire_and_death_post_render(self):
+        """Native $0B3F phase: occurs after $0437. Returns False on round exit."""
         if self.hawk_state < 0:
             self.hawk_death_timer -= 1
             if self.hawk_death_timer <= 0:
                 self.hawk_state = 0
+                self.pending_fire = False
                 self.finish_life()
+                return False
+            self.pending_fire = False
+            return True
+
+        if self.hawk_fire_cd > 0:
+            self.hawk_fire_cd -= 1
+
+        if self.pending_fire and self.hawk_state > 0 and self.hawk_fire_cd <= 0:
+            self.fire()
+        self.pending_fire = False
+        return True
+
+    def update_player_movement_post_render(self, keys):
+        """Native $0B9A/$0BBF phase, after fire/death."""
+        if self.hawk_state <= 0:
             return
 
-        # The original analog threshold is > $10. A held keyboard direction is
-        # treated as full analog input and therefore advances one substep/frame.
         if keys[pygame.K_LEFT]:
             self.move_entity_along_web(self.hawk, +1, 32)
         elif keys[pygame.K_RIGHT]:
             self.move_entity_along_web(self.hawk, -1, 32)
 
-        # Speed is discrete 0..24 in the ROM table domain.
         if self.frame % 4 == 0:
             if keys[pygame.K_UP]:
                 self.speed = min(24, self.speed + 1)
             if keys[pygame.K_DOWN]:
                 self.speed = max(0, self.speed - 1)
 
-        # Hawk radial depth update from joystick Y in the original is bounded
-        # between high bytes $78 and $E0. Keyboard forward/back modifies it
-        # modestly to retain those bounds.
         if keys[pygame.K_UP]:
             candidate = advance_depth(self.hawk.depth, 2, False)
             if 0x78 <= hi(candidate) <= 0xE0:
@@ -1424,48 +1513,71 @@ class Game:
             if 0x78 <= hi(candidate) <= 0xE0:
                 self.hawk.depth = candidate
 
-        if self.hawk_fire_cd:
-            self.hawk_fire_cd -= 1
-        if self.hawk_rod_timer:
+    def decrement_native_counters(self):
+        # Vec counter 6/C833 is the Capture Rod timer. Dec_Counters occurs
+        # immediately before $0FCE, so a newly pressed Button 3 sets it to $0D
+        # AFTER this decrement and remains fully visible next frame.
+        if self.hawk_rod_timer > 0:
             self.hawk_rod_timer -= 1
 
-        # Preserve cartridge subsystem order as much as a native renderer allows.
-        self.update_shots()
-        self.update_guardians()
-        self.update_dragon()
-        self.update_web_lines()
-        self.update_web_script()
-        self.update_creature()
+    def update_capture_rod_post_render(self):
+        if self.pending_rod and self.hawk_state > 0:
+            self.hawk_rod_timer = CAPTURE_ROD_FRAMES
+        self.pending_rod = False
         self.capture_test()
+
+    def post_render_play(self, keys):
+        """
+        Follow cartridge $0048 order AFTER WW_RenderAndAdvanceFrame.
+
+        Sound-only calls are represented by their position in this scheduler; the
+        current native port does not yet synthesize the AY chip exactly.
+        """
+        if not self.update_player_fire_and_death_post_render(): # $0B3F
+            return
+        if self.state != "PLAY":
+            return
+        self.update_player_movement_post_render(keys)         # $0B9A
+        self.bonus_check()                                    # $0B14
+        self.update_guardians()                               # $0CE1 approx AI
+        self.update_creature()
         self.spawn_portal_if_ready()
         self.update_portal()
         self.shot_collisions()
-        self.bonus_check()
+        self.update_dragon()                                  # Dragon body still partial
+        self.spawn_web_line_post_render()                     # $0F54
+        # $1D2A sound dispatch placeholder
+        self.update_web_script()                              # $1078
+        self.update_player_angle_latch()                      # $0FBF
+        self.latch_all_world_transforms()                     # $0C75
+        self.decrement_native_counters()                      # BIOS Dec_Counters
+        self.update_capture_rod_post_render()                 # $0FCE
+        # $1104 Dragon trigger is folded into current partial update_dragon().
+        # $0100 Trophy Room 2 behavior remains in portal progression handling.
 
-        if (
-            not self.creature_captured
-            and self.frame % max(65, 175 - (self.p.trophies & 0x7F) * 3) == 0
-        ):
-            self.spawn_guardian()
-
-    def update(self, keys):
+    def begin_frame(self):
+        """Wait_Recal-equivalent frame boundary before rendering."""
         self.frame += 1
-
         if self.message_timer:
             self.message_timer -= 1
             if not self.message_timer:
                 self.message = ""
 
+    def post_render_update(self, keys):
         if self.paused:
             return
-
         if self.state == "PLAY":
-            self.update_play(keys)
+            self.post_render_play(keys)
         elif self.state == "TROPHY":
             self.trophy_timer -= 1
             if self.trophy_timer <= 0:
                 self.state = "PLAY"
                 self.reset_round()
+
+    def update(self, keys):
+        """Compatibility wrapper; normal main loop uses begin_frame/draw/post."""
+        self.begin_frame()
+        self.post_render_update(keys)
 
     # ------------------------------------------------------------------
     # Input
@@ -1502,9 +1614,9 @@ class Game:
 
         elif self.state == "PLAY":
             if ev.key in (pygame.K_SPACE, pygame.K_4):
-                self.fire()
+                self.pending_fire = True
             elif ev.key in (pygame.K_c, pygame.K_3):
-                self.activate_rod()
+                self.pending_rod = True
 
         elif self.state == "TROPHY":
             if ev.key in (
@@ -1645,13 +1757,15 @@ class Game:
         transforms one original $1177 record and writes it back to CAB9 for the
         next frame. We model that write after drawing, preserving the pipeline.
         """
+        # $0437 advances the ring records before drawing them.
+        self.render_advance_web_depths()
+
         packet = self.web_packet
         displacement_table = self.web_displacement_table(packet)
 
-        rings = sorted(
-            [rec for rec in self.web_lines if rec["active"]],
-            key=lambda q: hi(q["depth"])
-        )
+        # Cartridge order is fixed RAM record order C900,C903,...C918. It does
+        # not depth-sort vector records like a raster 3-D engine.
+        rings = [rec for rec in self.web_lines if rec["active"]]
 
         for rec in rings:
             scale = hi(rec["depth"])
@@ -1737,18 +1851,20 @@ class Game:
                     )
 
     def shot_origin(self, s: Shot):
-        # Shots preserve the world position copied from Hawk and change only
-        # their radial/depth word.
-        tmp = MovingEntity(
-            active=True,
-            state=1,
-            depth=s.depth,
-            world_y=s.world_y,
-            world_x=s.world_x,
+        # Fire copies the already-latched player placement state into the shot
+        # record. Camera pre-move remains current, while shot radial depth changes.
+        p1, p2 = build_draw_displacement(
+            hi(self.camera_a), hi(self.camera_b),
+            s.transformed_y, s.transformed_x,
         )
-        return self.object_origin(tmp)[0]
+        pos = self.camera_pre_move((CX, CY))
+        scale = hi(s.depth)
+        pos = self.beam_move(pos, p1[0], p1[1], scale)
+        pos = self.beam_move(pos, p2[0], p2[1], scale)
+        return pos
 
     def draw_shots(self, r: Renderer):
+        self.render_advance_shots()
         for s in self.shots:
             if not s.active:
                 continue
@@ -1766,6 +1882,7 @@ class Game:
             )
 
     def draw_guardians(self, r: Renderer):
+        self.render_advance_guardian_depths()
         model = self.a.vector("11B9_guardian_drone")
 
         for g in self.guardians:
@@ -1797,6 +1914,7 @@ class Game:
         if not self.creature.active:
             return
 
+        self.render_advance_creature_depth()
         scale = max(1, hi(self.creature.depth) >> 2)
         self.draw_entity_model(
             r,
@@ -1814,6 +1932,7 @@ class Game:
         if not self.portal.active:
             return
 
+        self.render_advance_portal_depth()
         # Portal draw path retains full depth scale around the two move calls.
         scale = max(1, hi(self.portal.depth) >> 1)
         self.draw_entity_model(
@@ -1963,7 +2082,8 @@ class Game:
             f"web packet lag angle=${self.camera_angle_byte():02X}",
             f"hawk seg={self.hawk.segment} sub={self.hawk.subindex:02d}/32",
             f"hawk world Y=${self.hawk.world_y:04X} X=${self.hawk.world_x:04X}",
-            f"hawk xform=({transformed[0]:+d},{transformed[1]:+d})",
+            f"hawk xform LATCH=({transformed[0]:+d},{transformed[1]:+d})",
+            f"frame scheduler=RENDER -> POST ($0048)",
             f"$094F disp={disps[0]} {disps[1]}",
             f"origin=({origin[0]:.1f},{origin[1]:.1f}) depth=${self.hawk.depth:04X}",
             f"speed={self.speed} webdelay={self.current_web_delay():02X}",
@@ -1988,13 +2108,15 @@ class Game:
             self.draw_select(r, big, mid)
 
         elif self.state == "PLAY":
-            self.draw_web(r)
+            # $0437 order is intentionally foreground/player first, then
+            # projectiles, moving web, foreground rails and world objects.
+            self.draw_hawk(r)
+            self.draw_dragon(r)
             self.draw_shots(r)
+            self.draw_web(r)
             self.draw_guardians(r)
             self.draw_creature(r)
             self.draw_portal(r)
-            self.draw_dragon(r)
-            self.draw_hawk(r)
             self.draw_hud(r, small)
             self.draw_debug(r, tiny)
 
@@ -2135,7 +2257,29 @@ def self_test(a: Assets):
     assert ring_intensity_byte(0x00) == 0x30
     assert ring_intensity_byte(0xE0) == 0x76
 
+    # Transform latch must remain stable until explicit $0C75 phase.
+    g.camera_a = 0
+    g.camera_b = 0
+    g.web_angle_word = 0
+    g.latch_all_world_transforms()
+    before = (g.hawk.transformed_y, g.hawk.transformed_x)
+    g.hawk.world_x = u16(g.hawk.world_x + 0x1000)
+    assert (g.hawk.transformed_y, g.hawk.transformed_x) == before
+    g.latch_all_world_transforms()
+    assert (g.hawk.transformed_y, g.hawk.transformed_x) != before
+
+    # Runtime web records stay allocated past $E0; they are 16-bit records, not
+    # a depth-sorted/deactivated raster particle system.
+    g.web_lines = [{"active": True, "depth": 0xFFF0}] + [
+        {"active": False, "depth": 0x0280} for _ in range(8)
+    ]
+    g.speed = 4
+    g.render_advance_web_depths()
+    assert g.web_lines[0]["active"]
+    assert g.web_lines[0]["depth"] < 0xFFF0  # 16-bit wrap
+
     # Original-style prefill should start play with several receding rings.
+    g.reset_round()
     active_depths = sorted(
         (rec["depth"] for rec in g.web_lines if rec["active"]),
         reverse=True
@@ -2159,6 +2303,9 @@ def self_test(a: Assets):
     print("$094F independent ASRA/ASRB: OK")
     print("camera pre-move @ $7F: OK")
     print("$08CF packet pipeline + C92F displacement table: OK")
+    print("$0048 frame scheduler: render -> post-render update")
+    print("$0C75 transformed-coordinate latches: OK")
+    print("runtime web depth: 16-bit wrap, no fake $E0 free")
     print("$191C web motion script: deterministic, not random")
     print("$08CF foreground rails: 8 x 2 visible segments @ $E0")
     print("ring intensity $30..$76 formula: OK")
@@ -2226,7 +2373,7 @@ def main():
 
     pygame.init()
     screen = pygame.display.set_mode((W, H))
-    pygame.display.set_caption("Web Warp — Python vector reconstruction V9 — exact $08CF web geometry")
+    pygame.display.set_caption("Web Warp — Python vector reconstruction V10 — original frame scheduler")
     clock = pygame.time.Clock()
 
     fonts = (
@@ -2254,11 +2401,15 @@ def main():
                 break
 
             keys = pygame.key.get_pressed()
-            game.update(keys)
+            game.begin_frame()
 
+            # Original $0048 renders CURRENT/LATCHED state first.
             screen.fill(BLACK)
             game.draw(screen, fonts, keys)
             pygame.display.flip()
+
+            # Only now run $0B3F..$0100 to prepare NEXT frame.
+            game.post_render_update(keys)
             clock.tick(FPS)
 
     except KeyboardInterrupt:
