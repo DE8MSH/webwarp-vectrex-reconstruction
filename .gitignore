@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local cartridge/BIOS dumps — DO NOT COMMIT
+*.vec
+*.rom
+*.bin
+
+# ROM-derived assets — regenerate locally from your own dump
+web_warp_vectors.json
+web_warp_vectors*.json
+
+# Ghidra/local analysis artifacts
+*.gzf
+*.rep/
+*.gpr
+*.log
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
